@@ -1,0 +1,609 @@
+---
+title: "uju_report_1"
+output: html_document
+date: "2025-11-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+----------------Processing----------------------------------
+
+```{r}
+clinical <- read.delim("data_clinical_patient.txt", sep="\t", header=TRUE)
+mutations <- read.delim("data_mutations.txt", sep="\t", header=TRUE)
+rna <- read.csv("RNAseq_LIHC.csv", header=TRUE, row.names=1)
+
+dim(clinical)
+dim(mutations)
+dim(rna)
+head(rna[,1:5])
+
+```
+
+```{r}
+### code from lab 7
+# before analysis we first filtered the data to only count patients in all three datasets
+extract_id <- function(tcga_codes) {
+  tcga_codes <- as.character(tcga_codes)
+  ids <- sub("^TCGA-[A-Z0-9]{2}-([A-Z0-9]{4}).*", "\\1", tcga_codes)
+  return(ids)
+}
+
+extract_id_rnaseq <- function(tcga_codes) {
+  tcga_codes <- as.character(tcga_codes)
+  ids <- sub("^TCGA.[A-Z0-9]{2}.([A-Z0-9]{4}).*", "\\1", tcga_codes)
+  return(ids)
+}
+
+#extract id
+clinical_ids <- extract_id(clinical$X.Patient.Identifier)
+clinical_ids <- clinical_ids[-(1:4)]   # removes first 4 header rows 
+
+mutation_ids <- unique(extract_id(mutations$Tumor_Sample_Barcode))
+
+rnaseq_ids <- unique(extract_id_rnaseq(colnames(rna)))
+
+# finds the common ids. 
+common_ids <- clinical_ids[
+  clinical_ids %in% mutation_ids &
+  clinical_ids %in% rnaseq_ids
+]
+
+cat("Number of patients present in ALL THREE datasets:", length(common_ids), "\n")
+```
+
+```{r}
+clinical_filtered <- clinical[extract_id(clinical$X.Patient.Identifier) %in% common_ids, ]
+mutation_filtered <- mutations[extract_id(mutations$Tumor_Sample_Barcode) %in% common_ids, ]
+rnaseq_filtered <- rna[, extract_id_rnaseq(colnames(rna)) %in% common_ids]
+
+
+cat("Filtered clinical:", nrow(clinical_filtered), "\n")
+cat("Filtered mutation rows:", nrow(mutation_filtered), "\n")
+cat("Filtered rnaseq columns:", ncol(rnaseq_filtered), "\n")
+### guess some patients have more than 1 rna seq sample
+```
+
+
+--------------------------investigation 0-----------------------------------------------------------
+```{r}
+# Survival analysis by age 
+
+# Convert age column to numeric
+merged_data$Age <- as.numeric(merged_data$Diagnosis.Age)
+summary(merged_data$Age)
+
+# Remove missing age values (if any)
+age_data <- merged_data %>% filter(!is.na(Age))
+
+# Median age split
+median_age <- median(age_data$Age, na.rm = TRUE)
+median_age
+
+age_data$Age_Group <- ifelse(age_data$Age >= median_age,
+                             "Older",
+                             "Younger")
+
+table(age_data$Age_Group)
+
+# Kaplan-Meier survival analysis
+fit_age <- survfit(Surv(OS_time, OS_event) ~ Age_Group, data = age_data)
+
+plot(fit_age, col=c("blue","red"), lty=1:2,
+     main="Overall Survival by Age Group (LIHC)",
+     xlab="Time (months)",
+     ylab="Survival Probability")
+
+legend("bottomleft",
+       legend=levels(factor(age_data$Age_Group)),
+       col=c("blue","red"), lty=1:2)
+
+# Log-rank test
+age_test <- survdiff(Surv(OS_time, OS_event) ~ Age_Group, data = age_data)
+age_pval <- 1 - pchisq(age_test$chisq, length(age_test$n) - 1)
+age_pval
+
+#Median age = 61, so we split patients into:
+#Younger: <61 years (n = 172)
+# Older: ≥61 years (n = 180)
+#The older group has a lower survival probability, especially after ~50 months.But the difference is not statistically significant.
+#The trend still matches clinical expectations: older LIHC patients tend to do worse. But lacks statical significance...
+```
+
+```{r}
+# analysis on tumor stage
+stage_surv <- survfit(Surv(OS_time, OS_event) ~ Stage_simple, data = stage_data)
+
+plot(stage_surv, col=1:4, lty=1,
+     main="Survival by Tumor Stage (LIHC)")
+
+legend("bottomleft", legend=levels(factor(stage_data$Stage_simple)),
+       col=1:4, lty=1)
+
+survdiff(Surv(OS_time, OS_event) ~ Stage_simple, data=stage_data)
+
+### test to see wether ajcc tumor stage is associated with survival
+#Stage I (n = 172), Stage II (n = 80), Stage III (n = 82)
+#Log-rank test:χ² = 18.1, df = 2, p = 0.0001 --> meaning the stage-related survival differences are statistically significant.
+# also, this trend is clinically to be expected as later-stage LIHC generally has worse outcomes
+#dsf
+```
+
+```{r}
+#some more clincal data anylsis
+stage_data <- merged_data %>%
+  mutate(Stage_raw = Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code) %>%
+  filter(!is.na(Stage_raw), Stage_raw != "") %>%
+  mutate(
+    Stage_simple = case_when(
+      grepl("^STAGE I([^I]|$)", Stage_raw)   ~ "Stage I",   
+      grepl("^STAGE II([^I]|$)", Stage_raw)  ~ "Stage II",  
+      grepl("^STAGE III([^I]|$)", Stage_raw) ~ "Stage III", 
+      grepl("^STAGE IV([^I]|$)", Stage_raw)  ~ "Stage IV",  
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Stage_simple))
+
+# now add DSS time + event
+stage_data$DSS_time <- suppressWarnings(
+  as.numeric(stage_data$Months.of.disease.specific.survival)
+)
+
+stage_data$DSS_event <- ifelse(
+  grepl("DECEASED", stage_data$Disease.specific.Survival.status),
+  1,
+  0
+)
+
+# keep only rows with valid DSS time
+stage_dss <- stage_data %>% filter(!is.na(DSS_time))
+
+library(survival)
+
+fit_dss <- survfit(Surv(DSS_time, DSS_event) ~ Stage_simple, data = stage_dss)
+plot(fit_dss,
+     main = "Disease-specific survival by tumour stage",
+     xlab = "Time (months)", ylab = "DSS probability")
+
+survdiff(Surv(DSS_time, DSS_event) ~ Stage_simple, data = stage_dss)
+
+#“Disease-specific survival (DSS) could not be analyzed because all patients in the filtered cohort had DSS_event = 0 (no recorded disease-specific deaths). This results in undefined statistics in the log-rank test. Therefore, DSS was excluded from downstream analyses. Overall survival (OS) was used as the primary clinical endpoint.” -chat
+table(merged_data$DSS_event)
+#so theres 0 desease specific deaths. so on to the next analysis. we cant use this one.
+```
+
+```{r}
+table(merged_data$American.Joint.Committee.on.Cancer.Tumor.Stage.Code)
+
+merged_data$T_stage <- merged_data$American.Joint.Committee.on.Cancer.Tumor.Stage.Code
+
+# Simplify categories
+merged_data$T_stage_simple <- case_when(
+  grepl("^T1", merged_data$T_stage) ~ "T1",
+  grepl("^T2", merged_data$T_stage) ~ "T2",
+  grepl("^T3", merged_data$T_stage) ~ "T3",
+  grepl("^T4", merged_data$T_stage) ~ "T4",
+  TRUE ~ NA_character_
+)
+
+# larger and more invasive it is the higher number it is. T4 > T1
+table(merged_data$T_stage_simple)
+
+fit <- survfit(Surv(OS_time, OS_event) ~ T_stage_simple, data = merged_data)
+
+plot(
+  fit,
+  col = c("#1b9e77", "#d95f02", "#7570b3", "#e7298a"),
+  lwd = 2,
+  lty = 1:4,
+  xlab = "Time (months)",
+  ylab = "Survival Probability",
+  main = "Overall Survival by T-Stage (LIHC)"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(factor(merged_data$T_stage_simple)),
+  col = c("#1b9e77", "#d95f02", "#7570b3", "#e7298a"),
+  lty = 1:4,
+  lwd = 2,
+  bty = "n"
+)
+
+# so this is good. very statiscally significant
+#Survival analysis by AJCC T-stage (T1–T4) revealed a strong association between tumor invasiveness and patient outcomes. After extracting the primary tumor stage from the clinical dataset, patients were grouped into T1 (n = 174), T2 (n = 87), T3 (n = 75), and T4 (n = 13). Kaplan–Meier curves showed a clear stepwise decline in survival probability with increasing T-stage, with T4 patients demonstrating the poorest outcomes.
+
+#A log-rank test confirmed that these differences were highly statistically significant (χ² = 35, p = 1×10⁻⁷). This indicates that tumor size and local invasion are strong prognostic factors in LIHC, consistent with known clinical behavior of hepatocellular carcinoma and with trends reported in the TCGA LIHC study. - chat.
+```
+
+```{r}
+
+library(dplyr)
+library(survival)
+
+# 1. Clean and normalize sex labels
+merged_data$Sex_clean <- toupper(trimws(merged_data$Sex))
+
+# Check coding
+table(merged_data$Sex_clean, useNA = "ifany")
+
+# 2. Filter to valid sex + non-missing survival info
+sex_data <- merged_data %>%
+  filter(
+    Sex_clean %in% c("MALE", "FEMALE"),
+    !is.na(OS_time),
+    !is.na(OS_event)
+  )
+
+# Sanity check
+table(sex_data$Sex_clean)
+summary(sex_data$OS_time)
+
+# 3. Kaplan–Meier survival analysis by sex
+fit_sex <- survfit(Surv(OS_time, OS_event) ~ Sex_clean, data = sex_data)
+
+plot(
+  fit_sex,
+  col = c("blue", "red"),
+  lwd = 2,
+  lty = 1:2,
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  main = "Overall Survival by Sex (LIHC)"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(factor(sex_data$Sex_clean)),
+  col = c("blue", "red"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+# 4. Log-rank test
+sex_test  <- survdiff(Surv(OS_time, OS_event) ~ Sex_clean, data = sex_data)
+sex_pval  <- 1 - pchisq(sex_test$chisq, length(sex_test$n) - 1)
+sex_test
+sex_pval
+
+#not so significant
+
+```
+
+----------------------Investigation 1-------------------
+```{r}
+# to count mutations per gene 
+gene_counts <- mutation_filtered %>%
+  count(Hugo_Symbol, name = "Mutation_Count") %>%
+  arrange(desc(Mutation_Count))
+
+head(gene_counts, 20)
+
+
+top20_genes <- gene_counts %>% slice_max(Mutation_Count, n = 20)
+
+ggplot(top20_genes, aes(x = reorder(Hugo_Symbol, Mutation_Count), y = Mutation_Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Most Mutated Genes in LIHC",
+       x = "Gene",
+       y = "Number of Mutations") +
+  theme_minimal()
+```
+
+```{r}
+## Investigation 1: Are high-frequency genes more mutated in advanced tumour stages?
+
+library(dplyr)
+library(ggplot2)
+
+# 0. Make sure patient_id exists in mutation_nonsyn
+if (!"patient_id" %in% colnames(mutation_nonsyn)) {
+  mutation_nonsyn$patient_id <- extract_id(mutation_nonsyn$Tumor_Sample_Barcode)
+}
+
+# 1. Choose the 5 high-frequency genes (from your top20, excluding TTN/MUC16)
+top5_genes <- c("TP53", "CTNNB1", "OBSCN", "PCLO", "ALB")
+
+# 2. Build a simple clinical table with tumour stage
+clinical_stage <- clinical_with_id %>%
+  mutate(
+    Stage_raw = Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code,
+    Stage_simple = case_when(
+      grepl("^STAGE I([^I]|$)", Stage_raw)   ~ "Stage I",
+      grepl("^STAGE II([^I]|$)", Stage_raw)  ~ "Stage II",
+      grepl("^STAGE III([^I]|$)", Stage_raw) ~ "Stage III",
+      grepl("^STAGE IV([^I]|$)", Stage_raw)  ~ "Stage IV",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Stage_simple)) %>%
+  select(patient_id, Stage_simple)
+
+table(clinical_stage$Stage_simple)
+
+# 3. Restrict mutation data to the 5 genes and 1 row per (patient, gene)
+mut_top5 <- mutation_nonsyn %>%
+  filter(Hugo_Symbol %in% top5_genes) %>%
+  distinct(patient_id, Hugo_Symbol)
+
+head(mut_top5)
+
+# 4. Merge mutation info with stage
+mut_stage <- mut_top5 %>%
+  inner_join(clinical_stage, by = "patient_id")
+
+head(mut_stage)
+
+# 5. Count mutation frequencies per stage and gene
+freq_table <- mut_stage %>%
+  count(Stage_simple, Hugo_Symbol) %>%
+  group_by(Stage_simple) %>%
+  mutate(freq = n / sum(n))
+
+freq_table
+
+# 6. Plot: how these genes are distributed across stages
+ggplot(freq_table, aes(x = Stage_simple, y = freq, fill = Hugo_Symbol)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Mutation frequencies of selected high-frequency genes across tumour stages",
+    x = "Tumour stage",
+    y = "Proportion of patients with mutations",
+    fill = "Gene"
+  ) +
+  theme_minimal()
+
+# 7. Chi-square test: Stage vs Gene (are distributions different?)
+cont_table <- table(mut_stage$Stage_simple, mut_stage$Hugo_Symbol)
+chisq_result <- chisq.test(cont_table)
+
+chisq_result
+chisq_result$p.value
+
+```
+
+-----------------------------invetigation 5(?) ----------------------------------------------------
+```{r}
+library(dplyr)
+library(survival)
+
+# 1. Define the driver gene panel (from LIHC literature)
+driver_genes <- c(
+  "TP53", "CTNNB1", "AXIN1", "RB1",
+  "ALB", "APOB", "CPS1",
+  "LZTR1", "SF3B1", "SMARCA4", "EEF1A1"
+  # add "TERT" here if it exists in your mutation data
+)
+
+# 2. Define non-synonymous classes (same idea as your other analysis)
+nonsyn_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Translation_Start_Site",
+  "Nonstop_Mutation"
+)
+
+# 3. Make sure Patient_ID exists in mutation_filtered
+mutation_filtered$Patient_ID <- substr(mutation_filtered$Tumor_Sample_Barcode, 1, 12)
+
+# 4. Keep only non-synonymous driver gene mutations
+driver_mutations <- mutation_filtered %>%
+  filter(
+    Variant_Classification %in% nonsyn_classes,
+    Hugo_Symbol %in% driver_genes
+  ) %>%
+  distinct(Patient_ID, Hugo_Symbol)   # one row per patient–gene pair
+
+head(driver_mutations)
+
+# 5. Count how many distinct driver genes are mutated per patient
+driver_counts <- driver_mutations %>%
+  count(Patient_ID, name = "n_driver_genes")
+
+head(driver_counts)
+
+# 6. Merge driver counts into clinical + survival data
+surv_df <- merged_data %>%
+  left_join(driver_counts, by = "Patient_ID") %>%
+  mutate(
+    # patients with no driver mutations get 0
+    n_driver_genes = ifelse(is.na(n_driver_genes), 0L, n_driver_genes),
+    DriverGroup = ifelse(
+      n_driver_genes >= 2,
+      "2+ driver mutations",
+      "0–1 driver mutation"
+    )
+  ) %>%
+  # ensure survival info is complete
+  filter(!is.na(OS_time), !is.na(OS_event))
+
+table(surv_df$DriverGroup)
+summary(surv_df$n_driver_genes)
+
+# 7. Kaplan–Meier survival analysis: 0–1 vs 2+ driver mutations
+fit_drivers <- survfit(Surv(OS_time, OS_event) ~ DriverGroup, data = surv_df)
+
+plot(
+  fit_drivers,
+  col = c("blue", "red"),
+  lwd = 2,
+  lty = 1:2,
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  main = "Overall survival by driver gene mutation burden"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(factor(surv_df$DriverGroup)),
+  col = c("blue", "red"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+# 8. Log-rank test (are the survival curves different?)
+driver_test <- survdiff(Surv(OS_time, OS_event) ~ DriverGroup, data = surv_df)
+driver_pval <- 1 - pchisq(driver_test$chisq, length(driver_test$n) - 1)
+
+driver_test
+driver_pval
+```
+
+-----------------------------investigation 7--------------------------------------
+```{r}
+# Investigation 7: Do mutation-based clusters reproduce tumour stage / T-stage?
+
+library(dplyr)
+
+# 1. Attach patient_id to clinical data using the SAME ID format as clustering
+#    (4-character core ID via extract_id)
+clinical_with_id <- clinical_filtered %>%
+  mutate(patient_id = extract_id(X.Patient.Identifier))
+
+# Sanity check: first few IDs
+head(clinical_with_id$patient_id)
+
+# 2. Merge with mutation-based cluster labels
+#    (cluster_assignments should have: patient_id, cluster)
+clinical_clustered <- clinical_with_id %>%
+  inner_join(cluster_assignments, by = "patient_id") %>%
+  mutate(cluster = factor(cluster))
+
+# Check that we actually have rows now
+nrow(clinical_clustered)
+table(clinical_clustered$cluster)
+
+# 3. Create simplified tumour stage and T-stage variables
+clinical_clustered <- clinical_clustered %>%
+  mutate(
+    Stage_simple = case_when(
+      grepl("^STAGE I([^I]|$)", Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code)   ~ "Stage I",
+      grepl("^STAGE II([^I]|$)", Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code)  ~ "Stage II",
+      grepl("^STAGE III([^I]|$)", Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code) ~ "Stage III",
+      grepl("^STAGE IV",        Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code)   ~ "Stage IV",
+      TRUE ~ NA_character_
+    ),
+    T_stage_simple = case_when(
+      grepl("^T1", American.Joint.Committee.on.Cancer.Tumor.Stage.Code) ~ "T1",
+      grepl("^T2", American.Joint.Committee.on.Cancer.Tumor.Stage.Code) ~ "T2",
+      grepl("^T3", American.Joint.Committee.on.Cancer.Tumor.Stage.Code) ~ "T3",
+      grepl("^T4", American.Joint.Committee.on.Cancer.Tumor.Stage.Code) ~ "T4",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Quick sanity check
+table(clinical_clustered$Stage_simple, useNA = "ifany")
+table(clinical_clustered$T_stage_simple, useNA = "ifany")
+
+# 4. Tumour stage vs mutation cluster
+stage_df <- clinical_clustered %>% filter(!is.na(Stage_simple))
+
+tab_stage_cluster <- table(
+  Cluster = stage_df$cluster,
+  Stage   = stage_df$Stage_simple
+)
+
+tab_stage_cluster
+
+# Drop clusters that have no stage data at all (all-zero rows)
+tab_stage_cluster_clean <- tab_stage_cluster[rowSums(tab_stage_cluster) > 0, , drop = FALSE]
+
+tab_stage_cluster_clean
+
+# Only run chi-square if there is at least 1 non-zero cell
+if (sum(tab_stage_cluster_clean) > 0) {
+  stage_chi  <- chisq.test(tab_stage_cluster_clean)
+  stage_pval <- stage_chi$p.value
+  stage_chi
+  stage_pval
+} else {
+  stage_pval <- NA
+  print("No valid counts for stage × cluster chi-square test.")
+}
+
+# 5. T-stage vs mutation cluster
+tstage_df <- clinical_clustered %>% filter(!is.na(T_stage_simple))
+
+tab_T_cluster <- table(
+  Cluster = tstage_df$cluster,
+  T_stage = tstage_df$T_stage_simple
+)
+
+tab_T_cluster
+
+tab_T_cluster_clean <- tab_T_cluster[rowSums(tab_T_cluster) > 0, , drop = FALSE]
+
+tab_T_cluster_clean
+
+if (sum(tab_T_cluster_clean) > 0) {
+  T_chi  <- chisq.test(tab_T_cluster_clean)
+  T_pval <- T_chi$p.value
+  T_chi
+  T_pval
+} else {
+  T_pval <- NA
+  print("No valid counts for T-stage × cluster chi-square test.")
+}
+
+# 6. Row-wise proportions (optional, for interpretation)
+stage_prop  <- prop.table(tab_stage_cluster_clean, margin = 1)
+Tstage_prop <- prop.table(tab_T_cluster_clean,  margin = 1)
+
+stage_prop
+Tstage_prop
+
+library(ggplot2)
+
+### 1) Tumour stage distribution per cluster (stacked bar plot)
+
+# Convert contingency table to long data frame
+stage_long <- as.data.frame(tab_stage_cluster_clean)
+# Make sure the column names are what we expect
+# (should be "Cluster", "Stage", "Freq")
+colnames(stage_long) <- c("Cluster", "Stage", "Count")
+
+# Plot: proportion of each stage within each cluster
+ggplot(stage_long, aes(x = as.factor(Cluster), y = Count, fill = Stage)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Tumour Stage Distribution Across Mutation-Based Clusters",
+    x = "Cluster",
+    y = "Proportion within cluster",
+    fill = "Stage"
+  ) +
+  theme_minimal()
+
+
+### 2) T-stage distribution per cluster (stacked bar plot)
+
+tstage_long <- as.data.frame(tab_T_cluster_clean)
+# Columns should be "Cluster", "T_stage", "Freq"
+colnames(tstage_long) <- c("Cluster", "T_stage", "Count")
+
+ggplot(tstage_long, aes(x = as.factor(Cluster), y = Count, fill = T_stage)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "T-Stage Distribution Across Mutation-Based Clusters",
+    x = "Cluster",
+    y = "Proportion within cluster",
+    fill = "T-stage"
+  ) +
+  theme_minimal()
+```
+
