@@ -1,3 +1,0 @@
-print("cirkcied")
-
-#BombaClaart
